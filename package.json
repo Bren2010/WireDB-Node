@@ -1,0 +1,17 @@
+{
+  "name": "WireDB-Node",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "start": "node --harmony node.js",
+    "test": "NODE_ENV=default mocha -R spec"
+  },
+  "dependencies": {
+    "bencode": "*",
+    "config": "*",
+    "bigdecimal": "*",
+    "q": "*",
+    "sha1": "*",
+    "mocha": "*"
+  }
+}
