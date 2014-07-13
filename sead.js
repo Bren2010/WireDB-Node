@@ -50,6 +50,9 @@
         if (type === 2 && this.boxed.length === config.sead.y) {
           return 'update';
         }
+        if (type === 3 && this.boxed.length >= 49) {
+          return 'bcast';
+        }
         return 'bad';
       });
       this.__defineSetter__('type', function(type) {
@@ -64,19 +67,23 @@
           this.boxed = new Buffer(config.sead.y);
           this.boxed.fill(0);
           return this.boxed.writeUInt8(2, 0);
+        } else if (type === 'bcast') {
+          this.boxed = new Buffer(49);
+          this.boxed.fill(0);
+          return this.boxed.writeUInt8(3, 0);
         } else {
           return false;
         }
       });
       this.__defineGetter__('id', function() {
-        if (this.type === 'id' || this.type === 'update') {
+        if (this.type === 'id' || this.type === 'update' || this.type === 'bcast') {
           return this.boxed.slice(1, 49).toString('base64');
         } else {
           return null;
         }
       });
       this.__defineSetter__('id', function(id) {
-        if (this.type === 'id' || this.type === 'update') {
+        if (this.type === 'id' || this.type === 'update' || this.type === 'bcast') {
           return this.boxed.write(id, 1, 48, 'base64');
         } else {
           return null;
@@ -97,14 +104,14 @@
         }
       });
       this.__defineGetter__('cargo', function() {
-        if (this.type === 'data' || this.type === 'update') {
+        if (this.type === 'data' || this.type === 'update' || this.type === 'bcast') {
           return this.boxed.slice(49);
         } else {
           return null;
         }
       });
       this.__defineSetter__('cargo', function(cargo) {
-        if (this.type === 'data' || this.type === 'update') {
+        if (this.type === 'data' || this.type === 'update' || this.type === 'bcast') {
           cargo = new Buffer(cargo);
           return this.boxed = Buffer.concat([this.boxed.slice(0, 49), cargo]);
         } else {
@@ -261,6 +268,8 @@
       y = config.sead.m * config.sead.period;
       this.ttl = Math.max(x, y) + config.sead.timeouts.grace;
       this.ttl = Math.floor(this.ttl / 1000);
+      this.bcastTtl = (config.sead.m * 1000) + config.sead.timeouts.grace;
+      this.bcastTtl = Math.floor(this.bcastTtl / 1000);
       c = sjcl.ecc.curves.c192;
       this.keys = {
         elGamal: sjcl.ecc.elGamal.generateKeys(c)
@@ -277,7 +286,9 @@
       this.conns = {};
       this.table = {};
       this.cache = {};
-      setInterval(this.network, config.sead.period, this.conns, this.table);
+      this.heard = {};
+      this.sinceLast = {};
+      setInterval(this.network.bind(this), config.sead.period);
       run = (function(_this) {
         return function() {
           if (_this.table[_this.id] != null) {
@@ -288,13 +299,21 @@
       setInterval(run, config.sead.timeouts.interval);
       clean = (function(_this) {
         return function() {
-          var entry, id, _ref, _results;
+          var entry, id, timestamp, _ref, _ref1, _results;
           _ref = _this.table;
-          _results = [];
           for (id in _ref) {
             entry = _ref[id];
             if ((_this.time.get() - entry.timestamp) > _this.ttl) {
-              _results.push(delete _this.table[id]);
+              _this.emit('disconnect', id);
+              delete _this.table[id];
+            }
+          }
+          _ref1 = _this.heard;
+          _results = [];
+          for (id in _ref1) {
+            timestamp = _ref1[id];
+            if ((_this.time.get() - timestamp) > _this.bcastTtl) {
+              _results.push(delete _this.heard[id]);
             } else {
               _results.push(void 0);
             }
@@ -322,7 +341,7 @@
         this.committer = new caesar.tree.Committer(anchors, 'sha1');
         commit = this.committer.getCommit();
         proof = this.committer.getProof(0);
-        ts = time.get();
+        ts = this.time.get();
         tsStr = ts.toString();
         if (this.oldSecret != null) {
           signer = new caesar.kts.Signer(1, this.oldSecret);
@@ -337,7 +356,7 @@
         sig = this.keys.ecdsa.sec.sign(sjcl.hash.sha256.hash(sig));
         sig = sjcl.codec.base64.fromBits(sig);
         first = caesar.hash.chain(this.secret + ':0', 1, 'sha1');
-        return this.table[this.id] = new Entry({
+        this.table[this.id] = new Entry({
           metric: 0,
           next: null,
           sq: sq,
@@ -352,8 +371,10 @@
         first = caesar.hash.chain(val, 1, 'sha1');
         this.table[this.id].sq = sq;
         this.table[this.id].proof = this.committer.getProof(sq % config.sead.n);
-        return this.table[this.id].element = first;
+        this.table[this.id].element = first;
       }
+      this.sinceLast[this.id] = true;
+      return this.network(true);
     };
 
     Router.prototype.feed = function(conn, fn) {
@@ -380,6 +401,17 @@
               id = data.id;
               _this.conns[id] = conn;
               _this.conns[id].key = key;
+              _this.conns[id].needsFullDump = true;
+              _this.conns[id].secureWrite = function(data, fn) {
+                var buff, hmac;
+                hmac = crypto.createHmac('sha256', this.key);
+                hmac.end(data);
+                hmac = hmac.read();
+                buff = new Buffer(2);
+                buff.writeUInt16BE(data.length + hmac.length, 0);
+                buff = Buffer.concat([buff, data, hmac]);
+                return this.write(buff, fn);
+              };
               _this.configure();
               _this.conns[id]._expectedLen = 0;
               _this.conns[id]._store = new Buffer(0);
@@ -433,6 +465,11 @@
                   return _this.write(data.to, data.cargo);
                 } else if (data.type === 'update') {
                   return _this.update(id, data.id, data.cargo);
+                } else if (data.type === 'bcast' && (_this.heard[data.id] == null)) {
+                  _this.heard[data.id] = _this.time.get();
+                  return _this.emit('broadcast', data.id, data.cargo, function(fn) {
+                    return _this.broadcast(data.id, data.cargo, fn, id);
+                  });
                 }
               });
               _this.conns[id].on('close', function() {
@@ -462,19 +499,13 @@
     };
 
     Router.prototype.write = function(addr, data, fn) {
-      var buff, hmac, packet;
-      if ((this.table[addr] != null) && this.table[addr].metric !== Infinity) {
+      var packet, _ref;
+      if ((this.conns[(_ref = this.table[addr]) != null ? _ref.next : void 0] != null) && this.table[addr].metric !== Infinity) {
         packet = new Packet();
         packet.type = 'data';
         packet.to = addr;
         packet.cargo = data;
-        hmac = crypto.createHmac('sha256', this.conns[this.table[addr].next].key);
-        hmac.end(packet.boxed);
-        hmac = hmac.read();
-        buff = new Buffer(2);
-        buff.writeUInt16BE(packet.boxed.length + hmac.length, 0);
-        buff = Buffer.concat([buff, packet.boxed, hmac]);
-        this.conns[this.table[addr].next].write(buff);
+        this.conns[this.table[addr].next].secureWrite(packet.boxed);
         if (fn != null) {
           return fn(true);
         }
@@ -483,18 +514,38 @@
       }
     };
 
+    Router.prototype.broadcast = function(bid, data, fn, except) {
+      var id, packet;
+      if (except == null) {
+        except = null;
+      }
+      for (id in this.conns) {
+        if (!(id !== except)) {
+          continue;
+        }
+        packet = new Packet();
+        packet.type = 'bcast';
+        packet.id = bid;
+        packet.cargo = data;
+        this.conns[id].secureWrite(packet.boxed);
+      }
+      if (fn != null) {
+        return fn(true);
+      }
+    };
+
     Router.prototype.update = function(sender, id, cargo) {
-      var anchor, c, cand, err, fin, h, msg, newItr, num, old, oldItr, pubKey, root, sig, tmp, ver, x, _ref, _ref1;
+      var anchor, c, cand, err, fin, h, msg, newItr, num, old, oldItr, pubKey, root, sendUpdate, sig, tmp, ver, x, _ref, _ref1, _ref2;
       if (id === this.id) {
         return;
       }
       cand = new Entry();
       cand.boxed = cargo;
       if (this.table[id] != null) {
-        if (cand.timestamp > time.get()) {
+        if (cand.timestamp > this.time.get()) {
           return;
         }
-        if ((time.get() - cand.timestamp) > this.ttl) {
+        if ((this.time.get() - cand.timestamp) > this.ttl) {
           return;
         }
         if (cand.sq < this.table[id].sq) {
@@ -554,36 +605,53 @@
         err = _error;
         return;
       }
+      sendUpdate = ((_ref2 = this.table[id]) != null ? _ref2.sq : void 0) < cand.sq ? true : false;
+      if (this.table[id] == null) {
+        this.emit('connect', id);
+      }
+      this.sinceLast[id] = true;
       this.table[id] = cand;
       this.cache[id] = root;
+      this.network(true, id);
     };
 
-    Router.prototype.network = function(conns, table) {
-      var buff, cargo, conn, hmac, id, packet, peerId, _results;
-      _results = [];
-      for (id in conns) {
-        conn = conns[id];
-        _results.push((function() {
-          var _results1;
-          _results1 = [];
-          for (peerId in table) {
-            cargo = table[peerId];
-            packet = new Packet();
-            packet.type = 'update';
-            packet.id = peerId;
-            packet.cargo = cargo.boxed;
-            hmac = crypto.createHmac('sha256', conn.key);
-            hmac.end(packet.boxed);
-            hmac = hmac.read();
-            buff = new Buffer(2);
-            buff.writeUInt16BE(packet.boxed.length + hmac.length, 0);
-            buff = Buffer.concat([buff, packet.boxed, hmac]);
-            _results1.push(conn.write(buff));
-          }
-          return _results1;
-        })());
+    Router.prototype.network = function(triggered, except) {
+      var cargo, id, peerId, push, _ref;
+      if (triggered == null) {
+        triggered = false;
       }
-      return _results;
+      if (except == null) {
+        except = null;
+      }
+      push = function(conn, peerId, cargo) {
+        var packet;
+        packet = new Packet();
+        packet.type = 'update';
+        packet.id = peerId;
+        packet.cargo = cargo.boxed;
+        return conn.secureWrite(packet.boxed);
+      };
+      for (id in this.conns) {
+        if (id !== except) {
+          if (this.conns[id].needsFullDump && !triggered) {
+            this.conns[id].needsFullDump = false;
+            _ref = this.table;
+            for (peerId in _ref) {
+              cargo = _ref[peerId];
+              if (id !== peerId) {
+                push(this.conns[id], peerId, cargo);
+              }
+            }
+          } else {
+            for (peerId in this.sinceLast) {
+              if (id !== peerId && (this.table[peerId] != null)) {
+                push(this.conns[id], peerId, this.table[peerId]);
+              }
+            }
+          }
+        }
+      }
+      return this.sinceLast = {};
     };
 
     return Router;

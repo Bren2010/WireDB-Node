@@ -28,6 +28,7 @@ class Packet
             if type is 0 and @boxed.length is 49 then return 'id'
             if type is 1 and @boxed.length >= 49 then return 'data'
             if type is 2 and @boxed.length is config.sead.y then return 'update'
+            if type is 3 and @boxed.length >= 49 then return 'bcast'
 
             return 'bad'
 
@@ -45,17 +46,23 @@ class Packet
                 @boxed.fill 0
 
                 @boxed.writeUInt8 2, 0
+            else if type is 'bcast'
+                @boxed = new Buffer 49
+                @boxed.fill 0
+
+                @boxed.writeUInt8 3, 0
             else return false
 
         # type: 'id', id: ...
         # type: 'update', id: id, cargo: ...
+        # type: 'bcast', id: id, cargo: ...
         @__defineGetter__ 'id', ->
-            if @type is 'id' or @type is 'update'
+            if @type is 'id' or @type is 'update' or @type is 'bcast'
                 return @boxed.slice(1, 49).toString 'base64'
             else return null
 
         @__defineSetter__ 'id', (id) ->
-            if @type is 'id' or @type is 'update'
+            if @type is 'id' or @type is 'update' or @type is 'bcast'
                 @boxed.write id, 1, 48, 'base64'
             else return null
 
@@ -71,12 +78,12 @@ class Packet
             else return null
 
         @__defineGetter__ 'cargo', ->
-            if @type is 'data' or @type is 'update'
+            if @type is 'data' or @type is 'update' or @type is 'bcast'
                 return @boxed.slice(49)
             else return null
 
         @__defineSetter__ 'cargo', (cargo) ->
-            if @type is 'data' or @type is 'update'
+            if @type is 'data' or @type is 'update' or @type is 'bcast'
                 cargo = new Buffer cargo
                 @boxed = Buffer.concat [@boxed.slice(0, 49), cargo]
             else return null
@@ -190,6 +197,9 @@ class exports.Router extends EventEmitter
         @ttl = Math.max(x, y) + config.sead.timeouts.grace
         @ttl = Math.floor(@ttl / 1000)
 
+        @bcastTtl = (config.sead.m * 1000) + config.sead.timeouts.grace
+        @bcastTtl = Math.floor(@bcastTtl / 1000)
+
         c = sjcl.ecc.curves.c192
         @keys = elGamal: sjcl.ecc.elGamal.generateKeys(c)
 
@@ -214,18 +224,25 @@ class exports.Router extends EventEmitter
         @conns = {}
         @table = {}
         @cache = {}
+        @heard = {} # broadcasts already heard.
+        @sinceLast = {} # entrys changed since last dump
 
         # Every 5 seconds, distribute our routing table.
-        setInterval @network, config.sead.period, @conns, @table
+        setInterval @network.bind(this), config.sead.period
 
         # Push up sequence number every so often.
         run = => if @table[@id]? then @configure()
         setInterval run, config.sead.timeouts.interval
 
-        # Clean up routing table.
+        # Clean up routing table and list of heard broadcasts.
         clean = =>
             for id, entry of @table
-                if (@time.get() - entry.timestamp) > @ttl then delete @table[id]
+                if (@time.get() - entry.timestamp) > @ttl
+                    @emit 'disconnect', id
+                    delete @table[id]
+
+            for id, timestamp of @heard
+                if (@time.get() - timestamp) > @bcastTtl then delete @heard[id]
 
         setInterval clean, config.sead.timeouts.cleanup
 
@@ -254,7 +271,7 @@ class exports.Router extends EventEmitter
             commit = @committer.getCommit()
             proof = @committer.getProof 0
 
-            ts = time.get()
+            ts = @time.get()
             tsStr = ts.toString()
 
             # Sign the commitment cheaply.
@@ -294,6 +311,9 @@ class exports.Router extends EventEmitter
             @table[@id].proof = @committer.getProof(sq % config.sead.n)
             @table[@id].element = first
 
+        @sinceLast[@id] = true
+        @network true
+
     # Feeds the router a new connection.
     #
     # @param Stream  conn  The Read/Write stream to feed to the router.
@@ -327,6 +347,19 @@ class exports.Router extends EventEmitter
                     id = data.id
                     @conns[id] = conn
                     @conns[id].key = key
+                    @conns[id].needsFullDump = true
+                    @conns[id].secureWrite = (data, fn) ->
+                        # Create an HMAC on the shared key, and MAC the packet
+                        # with it.  Provides neighbor authentication.
+                        hmac = crypto.createHmac 'sha256', @key
+                        hmac.end data
+                        hmac = hmac.read()
+
+                        buff = new Buffer 2
+                        buff.writeUInt16BE data.length + hmac.length, 0
+                        buff = Buffer.concat [buff, data, hmac]
+
+                        @write buff, fn
 
                     @configure()
 
@@ -386,6 +419,10 @@ class exports.Router extends EventEmitter
                             @write data.to, data.cargo
                         else if data.type is 'update'
                             @update id, data.id, data.cargo
+                        else if data.type is 'bcast' and not @heard[data.id]?
+                            @heard[data.id] = @time.get()
+                            @emit 'broadcast', data.id, data.cargo, (fn) =>
+                                @broadcast data.id, data.cargo, fn, id
 
                     @conns[id].on 'close', =>
                         # Make sure metric is null.
@@ -406,25 +443,27 @@ class exports.Router extends EventEmitter
         conn.write packet.boxed
 
     write: (addr, data, fn) ->
-        if @table[addr]? and @table[addr].metric isnt Infinity
+        if @conns[@table[addr]?.next]? and @table[addr].metric isnt Infinity
             packet = new Packet()
             packet.type = 'data'
             packet.to = addr
             packet.cargo = data
 
-            # Create an HMAC on the shared key, and MAC the packet with it.
-            # Provides neighbor authentication.
-            hmac = crypto.createHmac 'sha256', @conns[@table[addr].next].key
-            hmac.end packet.boxed
-            hmac = hmac.read()
+            @conns[@table[addr].next].secureWrite packet.boxed
 
-            buff = new Buffer 2
-            buff.writeUInt16BE packet.boxed.length + hmac.length, 0
-            buff = Buffer.concat [buff, packet.boxed, hmac]
-
-            @conns[@table[addr].next].write buff
             if fn? then fn true
         else if fn? then fn false
+
+    broadcast: (bid, data, fn, except = null) ->
+        for id of @conns when id isnt except
+            packet = new Packet()
+            packet.type = 'bcast'
+            packet.id = bid
+            packet.cargo = data
+
+            @conns[id].secureWrite packet.boxed
+
+        if fn? then fn true
 
     update: (sender, id, cargo) ->
         if id is @id then return
@@ -434,8 +473,8 @@ class exports.Router extends EventEmitter
         cand.boxed = cargo
 
         if @table[id]?
-            if cand.timestamp > time.get() then return
-            if (time.get() - cand.timestamp) > @ttl then return
+            if cand.timestamp > @time.get() then return
+            if (@time.get() - cand.timestamp) > @ttl then return
 
             # If candidate's sq is less than current, always ignore.
             if cand.sq < @table[id].sq then return
@@ -499,26 +538,35 @@ class exports.Router extends EventEmitter
                 if not ver then return
         catch err then return
 
+        sendUpdate = if @table[id]?.sq < cand.sq then true else false
+        if not @table[id]? then @emit 'connect', id
+
+        @sinceLast[id] = true
         @table[id] = cand
         @cache[id] = root
 
+        @network true, id
+
         return
 
-    network: (conns, table) ->
+    network: (triggered = false, except = null) ->
         # Push a copy of the routing table to all neighbors.
-        for id, conn of conns
-            for peerId, cargo of table
-                packet = new Packet()
-                packet.type = 'update'
-                packet.id = peerId
-                packet.cargo = cargo.boxed
+        push = (conn, peerId, cargo) ->
+            packet = new Packet()
+            packet.type = 'update'
+            packet.id = peerId
+            packet.cargo = cargo.boxed
 
-                hmac = crypto.createHmac 'sha256', conn.key
-                hmac.end packet.boxed
-                hmac = hmac.read()
+            conn.secureWrite packet.boxed
 
-                buff = new Buffer 2
-                buff.writeUInt16BE packet.boxed.length + hmac.length, 0
-                buff = Buffer.concat [buff, packet.boxed, hmac]
+        for id of @conns when id isnt except
+            if @conns[id].needsFullDump and not triggered
+                @conns[id].needsFullDump = false
 
-                conn.write buff
+                for peerId, cargo of @table when id isnt peerId
+                    push @conns[id], peerId, cargo
+            else
+                for peerId of @sinceLast when id isnt peerId and @table[peerId]?
+                    push @conns[id], peerId, @table[peerId]
+
+        @sinceLast = {}
